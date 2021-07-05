@@ -1,0 +1,203 @@
+---
+title: "Intersection of ARs to HL genes - Two additional approaches"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+#BiocManager::install("GenomicRanges")
+#BiocManager::install("biomaRt")
+#install.packages("tidyverse")
+library("GenomicRanges")
+library("biomaRt")
+library("tidyverse")
+library("RCurl")
+```
+
+## Introduction
+
+In this notebook, I will add two approaches to intersect accelerated elements (ARs) to HL genes. Using a previous approach, we showed that the proportion of noncoding regions acting on HL was higher than the proportion of coding regions. In that initial approach, we used information from each gene's intronic region to subset the number of ARs that overlapped each gene. As per reviewer's suggest, a substantial number of potential regulatory accelerated elements located outside the gene's body could be incorporated.
+
+To accurately determine which potential AR could regulate a HL gene, some extra information about chromatin conformation (such as 4C or Hi-C) should be included. This data is unfortunately inexistent for the inner ear. Therefore, we can think of two approximations that could be more inclusive to try to solve this point:
+1) We could use chromatin conformation data from other tissues, since it was shown that since the genome is organized into hierarchical 3D structures, such as topologically associated domains (TADs),  that  are  thought  to  bring distal  regulatory  elements  in  close  proximity  to  the  target promoter.
+2) We could define a gene regulatory domain definition, such as that applied in GREAT and other studies (Roscito et al. 2019): Each gene is assigned a basal regulatory domain of a minimum distance upstream and downstream of the TSS (regardless of other nearby genes). The gene regulatory domain is extended in both directions to the nearest gene's basal domain but no more than the maximum extension in one direction.
+
+Using these two approximations, we will calculate if the proportion of noncoding (potentially regulatory) accelerated elements (ARs) is higher than the proportion of changes in coding regions. 
+
+![Figure 1. Simple scheme summarizing an approximation of the three approaches](associations.jpg)
+
+## Read data
+
+Read TADs from fetal human cortical plate (Won et al. 2016), read HL gene coordinates, read ARs coordinates.
+
+```{r read_tad}
+data <- read.table("TAD_fetalCP_Won2016.bed", col.names=c("chr", "start", "end"))
+tad <- with(data, GRanges(chr, IRanges(start, end)))
+genome(tad) <- "hg19"
+tad
+```
+
+Read HL gene coordinates
+```{r read_gene}
+gene_coord_table <- read.table("genecoords.txt", header = TRUE)
+gene_coord <- with(gene_coord_table, GRanges(chr, IRanges(start, end), id=gene_name))
+genome(gene_coord) <- "hg19"
+gene_coord
+```
+
+
+Read non-coding accelerated regions (ARs)
+```{r read_ar}
+AR_coord <- read.table("ars.txt", col.names=c("chr", "start", "end", "id"))
+AR_coord <- with(AR_coord, GRanges(chr, IRanges(start, end), id=id))
+genome(AR_coord) <- "hg19"
+AR_coord
+```
+
+## Associate using chromatin conformation data
+
+Intersect HL genes with TADs, retrieve TADs for each gene. 
+
+```{r intersect_tad_genes}
+my_overlaps <- findOverlaps(query = gene_coord, subject = tad)
+
+my_query <- queryHits(my_overlaps)
+my_subject <- subjectHits(my_overlaps)
+
+# chr,start,end from TAD, id from gene
+
+genes_in_TADs <- data.frame(chr = tad[my_subject]@seqnames,
+           start = tad[my_subject]@ranges@start,
+           end = tad[my_subject]@ranges@start + tad[my_subject]@ranges@width,
+           id = gene_coord[my_query]$id)
+
+genes_in_TADs <-  with(genes_in_TADs, GRanges(chr, IRanges(start, end), id=id))
+
+
+```
+
+Now that we have the TAD region for each set of HL genes, we will intersect these HL-TADs with the ARs coordinates, to get final set of ARs that are located within HL-TADs. 
+
+```{r intersect_tad_ars}
+tads_ars_overlaps <- findOverlaps(query = AR_coord, subject = genes_in_TADs)
+
+my_query <- queryHits(tads_ars_overlaps)
+my_subject <- subjectHits(tads_ars_overlaps)
+
+# chr,start,end from TADs, id from ARs and Gene
+
+ARs_in_HL_TADs <- data.frame(chr = genes_in_TADs[my_subject]@seqnames,
+           start = genes_in_TADs[my_subject]@ranges@start,
+           end = genes_in_TADs[my_subject]@ranges@start +     genes_in_TADs[my_subject]@ranges@width,
+           AR_id = AR_coord[my_query]$id,
+           Gene_id = genes_in_TADs[my_subject]$id)
+
+```
+
+Finally, we will count the number of AR elements per HL gene.
+
+```{r count_ars}
+ARs_in_HL_TADs_count <- ARs_in_HL_TADs %>% group_by(Gene_id) %>% summarize(count = n()) %>% arrange(desc(count))
+ARs_in_HL_TADs_count
+
+```
+
+
+The total number of genes that have elements located in their TAD (defined using Won 2016 data) is:  `r length(unique(ARs_in_HL_TADs$Gene_id))`.The above list includes all ARs elements that are located within a gene's TAD. 
+
+Can we be certain that these AR elements are indeed regulating the genes? *No*. 
+
+This is a very liberal approximation that assumes the following:
+- All elements located within a gene's TAD can regulate the gene's promoter.
+- An element can overlap several genes at the same time, but all belonging to the same TAD. In this case, the element could potentially regulate all of those genes and even other genes that it does not overlap but belong to the same TAD. 
+- The TADs used correspond to human fetal brain data. We are assuming that there is some sort of conservation within tissues and these TADs could be therefore used to infer function in the inner ear tissue. 
+The list is probably the upper limit of ARs that could be intersecting the HL genes and a very rough/dirty approximation. This approximation sets the proportion of HL genes with ARs being `r length(unique(ARs_in_HL_TADs$Gene_id))*100/length(unique(gene_coord))`%
+
+## Associate using a gene regulatory domain definition
+
+Definition of gene regulatory domain (GREAT http://great.stanford.edu/public/html/): "Each gene is assigned a basal regulatory domain of a minimum distance upstream and downstream of the TSS (regardless of other nearby genes). The gene regulatory domain is extended in both directions to the nearest gene's basal domain but no more than the maximum extension in one direction."
+
+The basal default settings consider: Proximal (5.0kb upstream, 
+1.0 kb downstream).
+
+We will replicate these settings in our data and re-associate the ARs to the HL genes. We first need to obtain putative TSS for each of our HL genes: we'll use data from the EPD database (UCSC track: [hub_24769_epdnew6] Human promoters from EPDnew version 006)
+
+
+```{r read_transform_epd}
+epd_in <- read.table("epd_006.txt", header = TRUE)
+epd <- epd_in %>% select("chr" = chrom, "start" = chromStart, "end" = chromEnd, strand, name)
+epd$name <- str_replace(epd_in$name, "_[:digit:]+" ,"")
+
+# Basal extension:
+for (row in 1:nrow(epd)){
+    epd$start[row] <- epd$start[row] - 5000   
+    epd$end[row] <- epd$end[row] + 1000 
+}
+
+
+# Extension to up to 1000kb:
+for (row in 1:nrow(epd)){
+    epd$start[row] <- epd$start[row] - 100000   
+    epd$end[row] <- epd$end[row] + 100000 
+}
+
+```
+
+We now have a data frame with all TSS coordinates extended in a basal regulatory domain (proximal, 5.0kb upstream, 1.0 kb downstream), plus an extension of up to 1000kb. We will filter it based on the HL genes, to get the final HL genes gene regulatory domain definition.
+
+
+```{r HL_regdomain}
+HL_regulatorydomain <- epd %>% filter(name %in% gene_coord_table$gene_name)
+
+
+HL_regulatorydomain <- with(HL_regulatorydomain, GRanges(chr, IRanges(start, end),strand, name=name))
+genome(HL_regulatorydomain) <- "hg19"
+
+
+```
+
+Now we use this information to intersect regulatory domains with ARs. 
+
+
+```{r intersect_regdom}
+my_overlaps <- findOverlaps(query = HL_regulatorydomain, subject = AR_coord)
+
+my_query <- queryHits(my_overlaps)
+my_subject <- subjectHits(my_overlaps)
+
+# Get gene name and ARs intersecting its regulatory domain
+
+genes_regdom_ARs<- data.frame(
+           gene = HL_regulatorydomain[my_query]$name,
+           AR = AR_coord[my_query]$id)
+
+# Remove duplicates, group by gene, count ARs
+Genes_Numb_ARs <- genes_regdom_ARs %>% distinct() %>% group_by(gene) %>% summarize(count = n()) %>% arrange(desc(count))
+Genes_Numb_ARs
+
+```
+
+Using this approach the total number of genes that have elements located in their regulatory domain (defined as: basal Proximal (5.0kb upstream, 1.0 kb downstream) + 1000kb each side) is:  `r length(unique(Genes_Numb_ARs$gene))`. This assumes the following:
+- The basal domain gene regulatory domain is extended 1000kb each side. This could be greater than the whole gene's size.
+- The whole gene regulatory domain could overlap other gene regulatory domains. We cannot be certain if one AR element is exclusive to other element or if there are boundary/isolating elements impeding regulatory domains to overlap. This approximation sets the proportion of HL genes with ARs being `r length(unique(Genes_Numb_ARs$gene))*100/length(unique(gene_coord))`%
+
+## Comparison to the original approach
+### Proportion of non-coding elements overlapping HL genes
+The original approach (only intersecting ARs to the intronic non-coding portions of a gene) estimated a total of 14 HL genes with non-coding ARs, which translates to a proportion of ~3%. The gene regulatory domain approach estimates a proportion of ~4%, while the upper limit using the TAD approach is estimated to be ~22%.
+
+### Proportion of coding elements overlapping HL genes
+In the original approach, we estimated that a higher proportion of coding elements overlapped HL genes. This was calculated in two ways:
+- 53 genes had PAML positive selection. This means ~12%. 
+- 63 genes had TSAR coding elements. This translates to: ~15%.
+With any of those measures, the proportion of coding elements is higher in comparison to the original estimated approach of non coding elements (~3%) and the regulatory domain approach (~4%). The proportion is not higher when using the TAD approach (~22%), but, as noted above, this is probably a very dirty estimation of the upper limit of elements that could potentially regulate the HL genes.
+
+## Conclusion
+Using a very conservative approach, it is estimated that the proportion of noncoding (potentially regulatory) accelerated elements (ARs) is higher than the proportion of changes in coding regions. The same pattern is observed using the regulatory domain approach. This pattern is not observed when using the  TAD approach, which probably calculates the upper limit of ARs that could interact with the HL genes.
+
+
+
+## References
+https://davetang.org/muse/2013/01/02/iranges-and-genomicranges/
